@@ -60,6 +60,28 @@ udp UNCONN 0 0 192.0.2.10%eth0:68 0.0.0.0:*
     def test_control_characters_sanitized(self):
         self.assertEqual(audit.clean('hello\x1b[31m'), 'hello?[31m')
 
+    def test_ipv6_empty_json_uses_successful_plain_fallback(self):
+        a = audit.Audit()
+        with patch.object(audit, 'run', side_effect=[{'ok': True, 'out': ''}, {'ok': True, 'out': ''}]):
+            a.ipv6()
+        self.assertEqual(a.evidence['ipv6'], [])
+        self.assertEqual(a.findings[0]['status'], 'INFO')
+
+    def test_ipv6_malformed_json_fallback_keeps_addresses(self):
+        a = audit.Audit()
+        plain = '2: eth0 inet6 2001:db8::5/64 scope global valid_lft forever preferred_lft forever'
+        with patch.object(audit, 'run', side_effect=[{'ok': True, 'out': '{}'}, {'ok': True, 'out': plain}]):
+            a.ipv6()
+        self.assertEqual(a.evidence['ipv6'], ['2001:db8::5'])
+
+    def test_ipv6_query_failure_does_not_claim_no_addresses(self):
+        a = audit.Audit()
+        with patch.object(audit, 'run', return_value={'ok': False, 'error': 'permission denied'}):
+            a.ipv6()
+        self.assertNotIn('ipv6', a.evidence)
+        self.assertEqual(a.findings[0]['status'], 'UNKNOWN')
+        self.assertIn('permission denied', a.findings[0]['detail'])
+
 
 if __name__ == '__main__':
     unittest.main()

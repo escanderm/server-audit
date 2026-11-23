@@ -15,7 +15,7 @@ import tempfile
 import time
 from terminal import Terminal
 
-VERSION = '1.1.1'
+VERSION = '1.1.2'
 
 
 def clean(value):
@@ -133,14 +133,54 @@ class Audit:
             self.evidence['forward_rules'] = rules
             if 'DOCKER' in rules or 'KUBE-' in rules:
                 self.add('WARN', 'Container forwarding', 'Docker/Kubernetes chains are present. UFW INPUT status alone does not establish protection for forwarded container traffic.')
-        text = self.command('IPv6 addresses', ['ip', '-j', '-6', 'addr', 'show', 'scope', 'global'])
-        if text is not None:
+        self.ipv6()
+
+    def ipv6(self):
+        args = ['ip', '-j', '-6', 'addr', 'show', 'scope', 'global']
+        result = run(args)
+        addresses = None
+        reason = result.get('error', '')
+        if result['ok']:
             try:
-                addresses = [a['local'] for i in json.loads(text) for a in i.get('addr_info', [])]
-                self.evidence['ipv6'] = addresses
-                self.add('WARN' if any(ipaddress.ip_address(a).is_global for a in addresses) else 'INFO', 'IPv6', ', '.join(addresses) or 'No global-scope IPv6 addresses assigned.')
-            except (ValueError, KeyError):
-                self.add('UNKNOWN', 'IPv6', 'Could not parse ip output.')
+                data = json.loads(result['out'])
+                if not isinstance(data, list):
+                    raise ValueError('Expected a JSON array')
+                addresses = []
+                for interface in data:
+                    for item in interface.get('addr_info', []):
+                        value = item['local']
+                        if ipaddress.ip_address(value.split('%')[0]).version != 6:
+                            raise ValueError('Non-IPv6 address in IPv6 response')
+                        addresses.append(value)
+            except (ValueError, KeyError, TypeError, AttributeError) as e:
+                addresses = None
+                reason = 'JSON response: ' + str(e)
+        if addresses is None:
+            # Some iproute2 versions return empty/non-JSON output with IPv6 disabled.
+            # A successful plain-text query can distinguish that from a failed check.
+            plain = run(['ip', '-o', '-6', 'addr', 'show', 'scope', 'global'])
+            if plain['ok']:
+                try:
+                    addresses = []
+                    for line in plain['out'].splitlines():
+                        fields = line.split()
+                        value = fields[fields.index('inet6') + 1].split('/')[0]
+                        if ipaddress.ip_address(value.split('%')[0]).version != 6:
+                            raise ValueError('Expected an IPv6 address')
+                        addresses.append(value)
+                    self.evidence['ipv6_parser'] = 'plain-text fallback'
+                except (ValueError, IndexError) as e:
+                    addresses = None
+                    reason += '; plain response: ' + str(e)
+            else:
+                reason += '; plain query: ' + (plain.get('error') or 'exit code ' + str(plain.get('code')))
+        if addresses is None:
+            self.add('UNKNOWN', 'IPv6', 'Address inventory failed, not proof of broken IPv6. ' + reason)
+            return
+        self.evidence['ipv6'] = sorted(set(addresses))
+        self.evidence['ipv6_disabled_all'] = read('/proc/sys/net/ipv6/conf/all/disable_ipv6')
+        detail = ', '.join(self.evidence['ipv6']) if addresses else 'No global-scope IPv6 addresses assigned.'
+        self.add('INFO', 'IPv6', detail + ' Address inventory only; routing and internet reachability were not tested.')
 
     def system(self):
         self.evidence['host'] = {'hostname': socket.gethostname(), 'kernel': os.uname().release,
